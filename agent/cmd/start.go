@@ -2,14 +2,19 @@ package cmd
 
 import (
 	"context"
+	"fmt"
 	"io/ioutil"
+	"os"
+	"os/signal"
 	"path/filepath"
+	"strings"
+	"syscall"
 
 	"github.com/sensu/sensu-go/agent"
 	corev2 "github.com/sensu/sensu-go/api/core/v2"
+	"github.com/sensu/sensu-go/asset"
 	"github.com/sensu/sensu-go/util/path"
 	"github.com/sensu/sensu-go/util/url"
-	"github.com/sensu/sensu-go/version"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -30,6 +35,8 @@ const (
 	flagAgentName                = "name"
 	flagAPIHost                  = "api-host"
 	flagAPIPort                  = "api-port"
+	flagAssetsRateLimit          = "assets-rate-limit"
+	flagAssetsBurstLimit         = "assets-burst-limit"
 	flagBackendURL               = "backend-url"
 	flagCacheDir                 = "cache-dir"
 	flagConfigFile               = "config-file"
@@ -75,131 +82,153 @@ const (
 	deprecatedFlagKeepaliveTimeout = "keepalive-timeout"
 )
 
-func newVersionCommand() *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "version",
-		Short: "Show the sensu-agent version information",
-		Run: func(cmd *cobra.Command, args []string) {
-			version.Println("sensu-agent")
-		},
+// InitializeFunc represents the signature of an initialization function, used
+// to initialize the agent
+type InitializeFunc func(context.Context, *agent.Config) (*agent.Agent, error)
+
+func NewAgentConfig(cmd *cobra.Command) (*agent.Config, error) {
+	if err := viper.BindPFlags(cmd.Flags()); err != nil {
+		return nil, err
+	}
+	level, err := logrus.ParseLevel(viper.GetString(flagLogLevel))
+	if err != nil {
+		return nil, err
+	}
+	logrus.SetLevel(level)
+
+	cfg := agent.NewConfig()
+	cfg.API.Host = viper.GetString(flagAPIHost)
+	cfg.API.Port = viper.GetInt(flagAPIPort)
+	cfg.AssetsRateLimit = rate.Limit(viper.GetFloat64(flagAssetsRateLimit))
+	cfg.AssetsBurstLimit = viper.GetInt(flagAssetsBurstLimit)
+	cfg.CacheDir = viper.GetString(flagCacheDir)
+	cfg.Deregister = viper.GetBool(flagDeregister)
+	cfg.DeregistrationHandler = viper.GetString(flagDeregistrationHandler)
+	cfg.DetectCloudProvider = viper.GetBool(flagDetectCloudProvider)
+	cfg.DisableAssets = viper.GetBool(flagDisableAssets)
+	cfg.EventsAPIRateLimit = rate.Limit(viper.GetFloat64(flagEventsRateLimit))
+	cfg.EventsAPIBurstLimit = viper.GetInt(flagEventsBurstLimit)
+	cfg.KeepaliveHandlers = viper.GetStringSlice(flagKeepaliveHandlers)
+	cfg.KeepaliveInterval = uint32(viper.GetInt(flagKeepaliveInterval))
+	cfg.KeepaliveWarningTimeout = uint32(viper.GetInt(flagKeepaliveWarningTimeout))
+	cfg.KeepaliveCriticalTimeout = uint32(viper.GetInt(flagKeepaliveCriticalTimeout))
+	cfg.Namespace = viper.GetString(flagNamespace)
+	cfg.Password = viper.GetString(flagPassword)
+	cfg.Socket.Host = viper.GetString(flagSocketHost)
+	cfg.Socket.Port = viper.GetInt(flagSocketPort)
+	cfg.StatsdServer.Disable = viper.GetBool(flagStatsdDisable)
+	cfg.StatsdServer.FlushInterval = viper.GetInt(flagStatsdFlushInterval)
+	cfg.StatsdServer.Host = viper.GetString(flagStatsdMetricsHost)
+	cfg.StatsdServer.Port = viper.GetInt(flagStatsdMetricsPort)
+	cfg.StatsdServer.Handlers = viper.GetStringSlice(flagStatsdEventHandlers)
+	cfg.Labels = viper.GetStringMapString(flagLabels)
+	cfg.Annotations = viper.GetStringMapString(flagAnnotations)
+	cfg.User = viper.GetString(flagUser)
+	cfg.AllowList = viper.GetString(flagAllowList)
+	cfg.BackendHandshakeTimeout = viper.GetInt(flagBackendHandshakeTimeout)
+	cfg.BackendHeartbeatInterval = viper.GetInt(flagBackendHeartbeatInterval)
+	cfg.BackendHeartbeatTimeout = viper.GetInt(flagBackendHeartbeatTimeout)
+
+	// TLS configuration
+	cfg.TLS = &corev2.TLSOptions{}
+	cfg.TLS.TrustedCAFile = viper.GetString(flagTrustedCAFile)
+	cfg.TLS.InsecureSkipVerify = viper.GetBool(flagInsecureSkipTLSVerify)
+	cfg.TLS.CertFile = viper.GetString(flagCertFile)
+	cfg.TLS.KeyFile = viper.GetString(flagKeyFile)
+
+	if cfg.KeepaliveCriticalTimeout != 0 && cfg.KeepaliveCriticalTimeout < cfg.KeepaliveWarningTimeout {
+		return nil, fmt.Errorf("if set, --%s must be greater than --%s",
+			flagKeepaliveCriticalTimeout, flagKeepaliveWarningTimeout)
 	}
 
+	agentName := viper.GetString(flagAgentName)
+	if agentName != "" {
+		cfg.AgentName = agentName
+	}
+
+	for _, backendURL := range viper.GetStringSlice(flagBackendURL) {
+		newURL, err := url.AppendPortIfMissing(backendURL, DefaultBackendPort)
+		if err != nil {
+			return nil, err
+		}
+		cfg.BackendURLs = append(cfg.BackendURLs, newURL)
+	}
+
+	cfg.Redact = viper.GetStringSlice(flagRedact)
+	cfg.Subscriptions = viper.GetStringSlice(flagSubscriptions)
+
+	// Workaround for https://github.com/sensu/sensu-go/issues/2357. Detect if
+	// the flags for labels and annotations were changed. If so, use their
+	// values since flags take precedence over config
+	if flag := cmd.Flags().Lookup(flagLabels); flag != nil && flag.Changed {
+		cfg.Labels = labels
+	}
+	if flag := cmd.Flags().Lookup(flagAnnotations); flag != nil && flag.Changed {
+		cfg.Annotations = annotations
+	}
+
+	cfg.DisableAPI = viper.GetBool(flagDisableAPI)
+	cfg.DisableSockets = viper.GetBool(flagDisableSockets)
+
+	return cfg, nil
+}
+
+func NewAgentRunE(initialize InitializeFunc, cmd *cobra.Command) func(cmd *cobra.Command, args []string) error {
+	return func(cmd *cobra.Command, args []string) error {
+		cfg, err := NewAgentConfig(cmd)
+		if err != nil {
+			return err
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		sensuAgent, err := initialize(ctx, cfg)
+		if err != nil {
+			return err
+		}
+
+		sigs := make(chan os.Signal, 1)
+		signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+		go func() {
+			defer cancel()
+			logger.Info("signal received: ", <-sigs)
+		}()
+
+		return sensuAgent.Run(ctx)
+	}
+}
+
+// StartCommand creates a new cobra command to start sensu-agent.
+func StartCommand(initialize InitializeFunc) *cobra.Command {
+	cmd, err := StartCommandWithError(initialize)
+	if err != nil {
+		// lol
+		panic(err)
+	}
 	return cmd
 }
 
-func newStartCommand(ctx context.Context, args []string, logger *logrus.Entry) *cobra.Command {
-	var setupErr error
-
+// StartCommandWithError is like StartCommand, but returns an error instead of
+// delegating the error handling to the RunE method.
+func StartCommandWithError(initialize InitializeFunc) (*cobra.Command, error) {
 	cmd := &cobra.Command{
 		Use:           "start",
 		Short:         "start the sensu agent",
 		SilenceErrors: true,
 		SilenceUsage:  true,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := viper.BindPFlags(cmd.Flags()); err != nil {
-				return err
-			}
-			if setupErr != nil {
-				return setupErr
-			}
-			level, err := logrus.ParseLevel(viper.GetString(flagLogLevel))
-			if err != nil {
-				return err
-			}
-			logrus.SetLevel(level)
-
-			cfg := agent.NewConfig()
-			cfg.API.Host = viper.GetString(flagAPIHost)
-			cfg.API.Port = viper.GetInt(flagAPIPort)
-			cfg.CacheDir = viper.GetString(flagCacheDir)
-			cfg.Deregister = viper.GetBool(flagDeregister)
-			cfg.DeregistrationHandler = viper.GetString(flagDeregistrationHandler)
-			cfg.DetectCloudProvider = viper.GetBool(flagDetectCloudProvider)
-			cfg.DisableAssets = viper.GetBool(flagDisableAssets)
-			cfg.EventsAPIRateLimit = rate.Limit(viper.GetFloat64(flagEventsRateLimit))
-			cfg.EventsAPIBurstLimit = viper.GetInt(flagEventsBurstLimit)
-			cfg.KeepaliveHandlers = viper.GetStringSlice(flagKeepaliveHandlers)
-			cfg.KeepaliveInterval = uint32(viper.GetInt(flagKeepaliveInterval))
-			cfg.KeepaliveWarningTimeout = uint32(viper.GetInt(flagKeepaliveWarningTimeout))
-			cfg.KeepaliveCriticalTimeout = uint32(viper.GetInt(flagKeepaliveCriticalTimeout))
-			cfg.Namespace = viper.GetString(flagNamespace)
-			cfg.Password = viper.GetString(flagPassword)
-			cfg.Socket.Host = viper.GetString(flagSocketHost)
-			cfg.Socket.Port = viper.GetInt(flagSocketPort)
-			cfg.StatsdServer.Disable = viper.GetBool(flagStatsdDisable)
-			cfg.StatsdServer.FlushInterval = viper.GetInt(flagStatsdFlushInterval)
-			cfg.StatsdServer.Host = viper.GetString(flagStatsdMetricsHost)
-			cfg.StatsdServer.Port = viper.GetInt(flagStatsdMetricsPort)
-			cfg.StatsdServer.Handlers = viper.GetStringSlice(flagStatsdEventHandlers)
-			cfg.Labels = viper.GetStringMapString(flagLabels)
-			cfg.Annotations = viper.GetStringMapString(flagAnnotations)
-			cfg.User = viper.GetString(flagUser)
-			cfg.AllowList = viper.GetString(flagAllowList)
-			cfg.BackendHandshakeTimeout = viper.GetInt(flagBackendHandshakeTimeout)
-			cfg.BackendHeartbeatInterval = viper.GetInt(flagBackendHeartbeatInterval)
-			cfg.BackendHeartbeatTimeout = viper.GetInt(flagBackendHeartbeatTimeout)
-
-			// TLS configuration
-			cfg.TLS = &corev2.TLSOptions{}
-			cfg.TLS.TrustedCAFile = viper.GetString(flagTrustedCAFile)
-			cfg.TLS.InsecureSkipVerify = viper.GetBool(flagInsecureSkipTLSVerify)
-			cfg.TLS.CertFile = viper.GetString(flagCertFile)
-			cfg.TLS.KeyFile = viper.GetString(flagKeyFile)
-
-			if cfg.KeepaliveCriticalTimeout != 0 && cfg.KeepaliveCriticalTimeout < cfg.KeepaliveWarningTimeout {
-				logger.Fatalf("if set, --%s must be greater than --%s",
-					flagKeepaliveCriticalTimeout, flagKeepaliveWarningTimeout)
-			}
-
-			agentName := viper.GetString(flagAgentName)
-			if agentName != "" {
-				cfg.AgentName = agentName
-			}
-
-			for _, backendURL := range viper.GetStringSlice(flagBackendURL) {
-				newURL, err := url.AppendPortIfMissing(backendURL, DefaultBackendPort)
-				if err != nil {
-					return err
-				}
-				cfg.BackendURLs = append(cfg.BackendURLs, newURL)
-			}
-
-			cfg.Redact = viper.GetStringSlice(flagRedact)
-			cfg.Subscriptions = viper.GetStringSlice(flagSubscriptions)
-
-			// Workaround for https://github.com/sensu/sensu-go/issues/2357. Detect if
-			// the flags for labels and annotations were changed. If so, use their
-			// values since flags take precedence over config
-			if flag := cmd.Flags().Lookup(flagLabels); flag != nil && flag.Changed {
-				cfg.Labels = labels
-			}
-			if flag := cmd.Flags().Lookup(flagAnnotations); flag != nil && flag.Changed {
-				cfg.Annotations = annotations
-			}
-
-			sensuAgent, err := agent.NewAgentContext(ctx, cfg)
-			if err != nil {
-				return err
-			}
-
-			if !viper.GetBool(flagDisableAPI) {
-				sensuAgent.StartAPI(ctx)
-			}
-
-			if !viper.GetBool(flagDisableSockets) {
-				// Agent TCP/UDP sockets are deprecated in favor of the agent rest api
-				sensuAgent.StartSocketListeners(ctx)
-			}
-
-			return sensuAgent.Run(ctx)
-		},
 	}
 
+	cmd.RunE = NewAgentRunE(initialize, cmd)
+	return cmd, handleConfig(cmd)
+}
+
+func handleConfig(cmd *cobra.Command) error {
 	// Set up distinct flagset for handling config file
 	configFlagSet := pflag.NewFlagSet("sensu", pflag.ContinueOnError)
-	_ = configFlagSet.StringP(flagConfigFile, "c", "", "path to sensu-agent config file")
+	configFileDefaultLocation := filepath.Join(path.SystemConfigDir(), "agent.yml")
+	configFileDefault := fmt.Sprintf("path to sensu-agent config file (default %q)", configFileDefaultLocation)
+	_ = configFlagSet.StringP(flagConfigFile, "c", "", configFileDefault)
 	configFlagSet.SetOutput(ioutil.Discard)
-	_ = configFlagSet.Parse(args[1:])
+	_ = configFlagSet.Parse(os.Args[1:])
 
 	// Get the given config file path
 	configFile, _ := configFlagSet.GetString(flagConfigFile)
@@ -226,6 +255,8 @@ func newStartCommand(ctx context.Context, args []string, logger *logrus.Entry) *
 	viper.SetDefault(flagDisableAPI, false)
 	viper.SetDefault(flagDisableSockets, false)
 	viper.SetDefault(flagDisableAssets, false)
+	viper.SetDefault(flagAssetsRateLimit, asset.DefaultAssetsRateLimit)
+	viper.SetDefault(flagAssetsBurstLimit, asset.DefaultAssetsBurstLimit)
 	viper.SetDefault(flagEventsRateLimit, agent.DefaultEventsAPIRateLimit)
 	viper.SetDefault(flagEventsBurstLimit, agent.DefaultEventsAPIBurstLimit)
 	viper.SetDefault(flagKeepaliveInterval, agent.DefaultKeepaliveInterval)
@@ -263,6 +294,8 @@ func newStartCommand(ctx context.Context, args []string, logger *logrus.Entry) *
 	cmd.Flags().String(flagCacheDir, viper.GetString(flagCacheDir), "path to store cached data")
 	cmd.Flags().String(flagDeregistrationHandler, viper.GetString(flagDeregistrationHandler), "deregistration handler that should process the entity deregistration event")
 	cmd.Flags().Bool(flagDetectCloudProvider, viper.GetBool(flagDetectCloudProvider), "enable cloud provider detection")
+	cmd.Flags().Float64(flagAssetsRateLimit, viper.GetFloat64(flagAssetsRateLimit), "maximum number of assets fetched per second")
+	cmd.Flags().Int(flagAssetsBurstLimit, viper.GetInt(flagAssetsBurstLimit), "asset fetch burst limit")
 	cmd.Flags().Float64(flagEventsRateLimit, viper.GetFloat64(flagEventsRateLimit), "maximum number of events transmitted to the backend through the /events api")
 	cmd.Flags().Int(flagEventsBurstLimit, viper.GetInt(flagEventsBurstLimit), "/events api burst limit")
 	cmd.Flags().String(flagNamespace, viper.GetString(flagNamespace), "agent namespace")
@@ -299,14 +332,18 @@ func newStartCommand(ctx context.Context, args []string, logger *logrus.Entry) *
 	cmd.Flags().SetNormalizeFunc(aliasNormalizeFunc(logger))
 
 	if err := viper.ReadInConfig(); err != nil && configFile != "" {
-		setupErr = err
+		return err
 	}
+
+	viper.SetEnvPrefix("sensu")
+	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
+	viper.AutomaticEnv()
 
 	deprecatedConfigAttributes(logger)
 	viper.RegisterAlias(deprecatedFlagAgentID, flagAgentName)
 	viper.RegisterAlias(deprecatedFlagKeepaliveTimeout, flagKeepaliveWarningTimeout)
 
-	return cmd
+	return nil
 }
 
 func aliasNormalizeFunc(logger *logrus.Entry) func(*pflag.FlagSet, string) pflag.NormalizedName {

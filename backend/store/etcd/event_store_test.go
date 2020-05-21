@@ -138,6 +138,10 @@ func TestEventStorage(t *testing.T) {
 			t.Errorf("bad event: got %v, want %v", got, want)
 		}
 
+		events, err = s.GetEventsByEntity(ctx, "entit", pred)
+		assert.NoError(t, err)
+		assert.Nil(t, events)
+
 		assert.NoError(t, s.DeleteEventByEntityCheck(ctx, "entity1", "check1"))
 		newEv, err = s.GetEventByEntityCheck(ctx, "entity1", "check1")
 		assert.Nil(t, newEv)
@@ -703,4 +707,84 @@ func TestHandleExpireOnResolveEntries(t *testing.T) {
 			assert.Equal(t, tc.expectedSilencedEntries, tc.event.Check.Silenced)
 		})
 	}
+}
+
+func TestEventStoreHistory(t *testing.T) {
+	testWithEtcd(t, func(s store.Store) {
+		ctx := store.NamespaceContext(context.Background(), "default")
+		event := corev2.FixtureEvent("foo", "bar")
+		want := []corev2.CheckHistory{}
+		for i := 0; i < 30; i++ {
+			event.Check.Executed = int64(i)
+			historyItem := corev2.CheckHistory{
+				Executed: int64(i),
+			}
+			want = append(want, historyItem)
+			_, _, err := s.UpdateEvent(ctx, event)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		want = want[len(want)-21:]
+		event, err := s.GetEventByEntityCheck(ctx, "foo", "bar")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 21; i++ {
+		}
+		if got := event.Check.History; !reflect.DeepEqual(got, want) {
+			t.Fatalf("bad event history: got %v, want %v", got, want)
+		}
+	})
+}
+
+func TestStateLastOK(t *testing.T) {
+	// Test that LastOK and State are well defined even after the first update.
+	testWithEtcd(t, func(s store.Store) {
+		ctx := store.NamespaceContext(context.Background(), "default")
+		event := corev2.FixtureEvent("foo", "bar")
+		event.Check.LastOK = 0
+		event.Check.State = ""
+		event.Check.Status = 0
+
+		event, previous, err := s.UpdateEvent(ctx, event)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if previous != nil {
+			t.Fatal("expected previous to be nil")
+		}
+
+		if got, want := event.Check.State, corev2.EventPassingState; got != want {
+			t.Fatalf("bad check state: got %s, want %s", got, want)
+		}
+
+		if got, want := event.Check.LastOK, event.Check.Executed; got != want {
+			t.Fatalf("bad last ok: got %v, want %v", got, want)
+		}
+
+		event = corev2.FixtureEvent("bar", "baz")
+		event.Check.LastOK = 0
+		event.Check.State = ""
+		event.Check.Status = 1
+
+		event, previous, err = s.UpdateEvent(ctx, event)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if previous != nil {
+			t.Fatal("expected previous to be nil")
+		}
+
+		if got, want := event.Check.State, corev2.EventFailingState; got != want {
+			t.Fatalf("bad check state: got %s, want %s", got, want)
+		}
+
+		if got, want := event.Check.LastOK, int64(0); got != want {
+			t.Fatalf("bad last ok: got %v, want %v", got, want)
+		}
+	})
+
 }

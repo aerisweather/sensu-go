@@ -13,6 +13,7 @@ import (
 	"syscall"
 
 	corev2 "github.com/sensu/sensu-go/api/core/v2"
+	"github.com/sensu/sensu-go/asset"
 	"github.com/sensu/sensu-go/backend"
 	"github.com/sensu/sensu-go/backend/etcd"
 	"github.com/sensu/sensu-go/util/path"
@@ -21,6 +22,12 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
+	"golang.org/x/time/rate"
+)
+
+var (
+	annotations map[string]string
+	labels      map[string]string
 )
 
 const (
@@ -30,6 +37,8 @@ const (
 	flagAgentPort             = "agent-port"
 	flagAPIListenAddress      = "api-listen-address"
 	flagAPIURL                = "api-url"
+	flagAssetsRateLimit       = "assets-rate-limit"
+	flagAssetsBurstLimit      = "assets-burst-limit"
 	flagDashboardHost         = "dashboard-host"
 	flagDashboardPort         = "dashboard-port"
 	flagDashboardCertFile     = "dashboard-cert-file"
@@ -43,6 +52,8 @@ const (
 	flagInsecureSkipTLSVerify = "insecure-skip-tls-verify"
 	flagDebug                 = "debug"
 	flagLogLevel              = "log-level"
+	flagLabels                = "labels"
+	flagAnnotations           = "annotations"
 
 	// Etcd flag constants
 	flagEtcdClientURLs               = "etcd-client-urls"
@@ -118,7 +129,7 @@ Use "{{.CommandPath}} [command] --help" for more information about a command.{{e
 `
 )
 
-// initializeFunc represents the signature of an initialization function, used
+// InitializeFunc represents the signature of an initialization function, used
 // to initialize the backend
 type InitializeFunc func(context.Context, *backend.Config) (*backend.Backend, error)
 
@@ -167,6 +178,8 @@ func StartCommand(initialize InitializeFunc) *cobra.Command {
 				AgentWriteTimeout:     viper.GetInt(backend.FlagAgentWriteTimeout),
 				APIListenAddress:      viper.GetString(flagAPIListenAddress),
 				APIURL:                viper.GetString(flagAPIURL),
+				AssetsRateLimit:       rate.Limit(viper.GetFloat64(flagAssetsRateLimit)),
+				AssetsBurstLimit:      viper.GetInt(flagAssetsBurstLimit),
 				DashboardHost:         viper.GetString(flagDashboardHost),
 				DashboardPort:         viper.GetInt(flagDashboardPort),
 				DashboardTLSCertFile:  viper.GetString(flagDashboardCertFile),
@@ -192,6 +205,15 @@ func StartCommand(initialize InitializeFunc) *cobra.Command {
 				EtcdHeartbeatInterval:        viper.GetUint(flagEtcdHeartbeatInterval),
 				EtcdElectionTimeout:          viper.GetUint(flagEtcdElectionTimeout),
 				NoEmbedEtcd:                  viper.GetBool(flagNoEmbedEtcd),
+				Labels:                       viper.GetStringMapString(flagLabels),
+				Annotations:                  viper.GetStringMapString(flagAnnotations),
+			}
+
+			if flag := cmd.Flags().Lookup(flagLabels); flag != nil && flag.Changed {
+				cfg.Labels = labels
+			}
+			if flag := cmd.Flags().Lookup(flagAnnotations); flag != nil && flag.Changed {
+				cfg.Annotations = annotations
 			}
 
 			// Sensu APIs TLS config
@@ -250,7 +272,6 @@ func StartCommand(initialize InitializeFunc) *cobra.Command {
 					log.Println(http.ListenAndServe("127.0.0.1:6060", nil))
 				}()
 			}
-
 			return sensuBackend.RunWithInitializer(initialize)
 		},
 	}
@@ -263,7 +284,9 @@ func StartCommand(initialize InitializeFunc) *cobra.Command {
 func handleConfig(cmd *cobra.Command, server bool) error {
 	// Set up distinct flagset for handling config file
 	configFlagSet := pflag.NewFlagSet("sensu", pflag.ContinueOnError)
-	configFlagSet.StringP(flagConfigFile, "c", "", "path to sensu-backend config file")
+	configFileDefaultLocation := filepath.Join(path.SystemConfigDir(), "backend.yml")
+	configFileDefault := fmt.Sprintf("path to sensu-backend config file (default %q)", configFileDefaultLocation)
+	configFlagSet.StringP(flagConfigFile, "c", "", configFileDefault)
 	configFlagSet.SetOutput(ioutil.Discard)
 	_ = configFlagSet.Parse(os.Args[1:])
 
@@ -273,7 +296,7 @@ func handleConfig(cmd *cobra.Command, server bool) error {
 
 	// use the default config path if flagConfigFile was used
 	if configFile == "" {
-		configFilePath = filepath.Join(path.SystemConfigDir(), "backend.yml")
+		configFilePath = configFileDefaultLocation
 	}
 
 	// Configure location of backend configuration
@@ -286,6 +309,8 @@ func handleConfig(cmd *cobra.Command, server bool) error {
 		viper.SetDefault(flagAgentPort, 8081)
 		viper.SetDefault(flagAPIListenAddress, "[::]:8080")
 		viper.SetDefault(flagAPIURL, "http://localhost:8080")
+		viper.SetDefault(flagAssetsRateLimit, asset.DefaultAssetsRateLimit)
+		viper.SetDefault(flagAssetsBurstLimit, asset.DefaultAssetsBurstLimit)
 		viper.SetDefault(flagDashboardHost, "[::]")
 		viper.SetDefault(flagDashboardPort, 3000)
 		viper.SetDefault(flagDashboardCertFile, "")
@@ -336,6 +361,8 @@ func handleConfig(cmd *cobra.Command, server bool) error {
 		cmd.Flags().Int(flagAgentPort, viper.GetInt(flagAgentPort), "agent listener port")
 		cmd.Flags().String(flagAPIListenAddress, viper.GetString(flagAPIListenAddress), "address to listen on for api traffic")
 		cmd.Flags().String(flagAPIURL, viper.GetString(flagAPIURL), "url of the api to connect to")
+		cmd.Flags().Float64(flagAssetsRateLimit, viper.GetFloat64(flagAssetsRateLimit), "maximum number of assets fetched per second")
+		cmd.Flags().Int(flagAssetsBurstLimit, viper.GetInt(flagAssetsBurstLimit), "asset fetch burst limit")
 		cmd.Flags().String(flagDashboardHost, viper.GetString(flagDashboardHost), "dashboard listener host")
 		cmd.Flags().Int(flagDashboardPort, viper.GetInt(flagDashboardPort), "dashboard listener port")
 		cmd.Flags().String(flagDashboardCertFile, viper.GetString(flagDashboardCertFile), "dashboard TLS certificate in PEM format")
@@ -358,6 +385,8 @@ func handleConfig(cmd *cobra.Command, server bool) error {
 		cmd.Flags().Int(backend.FlagAgentWriteTimeout, viper.GetInt(backend.FlagAgentWriteTimeout), "timeout in seconds for agent writes")
 		cmd.Flags().String(backend.FlagJWTPrivateKeyFile, viper.GetString(backend.FlagJWTPrivateKeyFile), "path to the PEM-encoded private key to use to sign JWTs")
 		cmd.Flags().String(backend.FlagJWTPublicKeyFile, viper.GetString(backend.FlagJWTPublicKeyFile), "path to the PEM-encoded public key to use to verify JWT signatures")
+		cmd.Flags().StringToStringVar(&labels, flagLabels, nil, "entity labels map")
+		cmd.Flags().StringToStringVar(&annotations, flagAnnotations, nil, "entity annotations map")
 
 		// Etcd server flags
 		cmd.Flags().StringSlice(flagEtcdPeerURLs, viper.GetStringSlice(flagEtcdPeerURLs), "list of URLs to listen on for peer traffic")

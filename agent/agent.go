@@ -7,10 +7,11 @@ package agent
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -18,12 +19,14 @@ import (
 	time "github.com/echlebek/timeproxy"
 	"github.com/gogo/protobuf/proto"
 	"github.com/google/uuid"
+	"golang.org/x/time/rate"
 
 	corev2 "github.com/sensu/sensu-go/api/core/v2"
 	"github.com/sensu/sensu-go/asset"
 	"github.com/sensu/sensu-go/backend/agentd"
 	"github.com/sensu/sensu-go/command"
 	"github.com/sensu/sensu-go/handler"
+	"github.com/sensu/sensu-go/process"
 	"github.com/sensu/sensu-go/system"
 	"github.com/sensu/sensu-go/transport"
 	"github.com/sensu/sensu-go/util/retry"
@@ -65,6 +68,9 @@ type Agent struct {
 	apiQueue        queue
 	marshal         agentd.MarshalFunc
 	unmarshal       agentd.UnmarshalFunc
+
+	// ProcessGetter gets information about local agent processes.
+	ProcessGetter process.Getter
 }
 
 // NewAgent creates a new Agent. It returns non-nil error if there is any error
@@ -76,6 +82,12 @@ func NewAgent(config *Config) (*Agent, error) {
 // NewAgentContext is like NewAgent, but allows threading a context through
 // the system.
 func NewAgentContext(ctx context.Context, config *Config) (*Agent, error) {
+	if to := config.KeepaliveCriticalTimeout; to > 0 && to <= config.KeepaliveInterval {
+		return nil, errors.New("keepalive critical timeout must be greater than keepalive interval")
+	}
+	if to := config.KeepaliveWarningTimeout; to > 0 && to <= config.KeepaliveInterval {
+		return nil, errors.New("keepalive warning timeout must be greater than keepalive interval")
+	}
 	agent := &Agent{
 		backendSelector: &RandomBackendSelector{Backends: config.BackendURLs},
 		connected:       false,
@@ -88,6 +100,7 @@ func NewAgentContext(ctx context.Context, config *Config) (*Agent, error) {
 		systemInfo:      &corev2.System{},
 		unmarshal:       agentd.UnmarshalJSON,
 		marshal:         agentd.MarshalJSON,
+		ProcessGetter:   &process.NoopProcessGetter{},
 	}
 
 	agent.statsdServer = NewStatsdServer(agent)
@@ -97,7 +110,7 @@ func NewAgentContext(ctx context.Context, config *Config) (*Agent, error) {
 	// of system info status.
 	systemInfoCtx, cancel := context.WithTimeout(ctx, time.Duration(DefaultSystemInfoRefreshInterval)*time.Second)
 	defer cancel()
-	_ = agent.refreshSystemInfo(systemInfoCtx)
+	_ = agent.RefreshSystemInfo(systemInfoCtx)
 	if err := systemInfoCtx.Err(); err != nil {
 		logger.WithError(err).Error("couldn't refresh all system information within deadline")
 	}
@@ -125,7 +138,8 @@ func (a *Agent) sendMessage(msg *transport.Message) {
 	a.sendq <- msg
 }
 
-func (a *Agent) refreshSystemInfo(ctx context.Context) error {
+// RefreshSystemInfo refreshes system, platform, and process information.
+func (a *Agent) RefreshSystemInfo(ctx context.Context) error {
 	info, err := system.Info()
 	if err != nil {
 		return err
@@ -134,6 +148,12 @@ func (a *Agent) refreshSystemInfo(ctx context.Context) error {
 	if a.config.DetectCloudProvider {
 		info.CloudProvider = system.GetCloudProvider(ctx)
 	}
+
+	proccessInfo, err := a.ProcessGetter.Get(ctx)
+	if err != nil {
+		return err
+	}
+	info.Processes = proccessInfo
 
 	a.systemInfoMu.Lock()
 	a.systemInfo = &info
@@ -152,7 +172,7 @@ func (a *Agent) refreshSystemInfoPeriodically(ctx context.Context) {
 		case <-ticker.C:
 			ctx, cancel := context.WithTimeout(ctx, time.Duration(DefaultSystemInfoRefreshInterval)*time.Second/2)
 			defer cancel()
-			if err := a.refreshSystemInfo(ctx); err != nil {
+			if err := a.RefreshSystemInfo(ctx); err != nil {
 				logger.WithError(err).Error("failed to refresh system info")
 			}
 		case <-ctx.Done():
@@ -191,6 +211,7 @@ func (a *Agent) buildTransportHeaderMap() http.Header {
 // 8. Start sending periodic keepalives.
 // 9. Start the API server, shutdown the agent if doing so fails.
 func (a *Agent) Run(ctx context.Context) error {
+	ctx, cancel := context.WithCancel(ctx)
 	defer func() {
 		if err := a.apiQueue.Close(); err != nil {
 			logger.WithError(err).Error("error closing API queue")
@@ -199,20 +220,46 @@ func (a *Agent) Run(ctx context.Context) error {
 	a.header = a.buildTransportHeaderMap()
 
 	// Fail the agent after startup if the id is invalid
+	logger.Debug("validating agent name")
 	if err := corev2.ValidateName(a.config.AgentName); err != nil {
 		return fmt.Errorf("invalid agent name: %v", err)
 	}
+	logger.Debug("validating keepalive warning timeout")
 	if timeout := a.config.KeepaliveWarningTimeout; timeout < 5 {
 		return fmt.Errorf("bad keepalive timeout: %d (minimum value is 5 seconds)", timeout)
 	}
+	logger.Debug("validating keepalive critical timeout")
 	if timeout := a.config.KeepaliveCriticalTimeout; timeout > 0 && timeout < 5 {
 		return fmt.Errorf("bad keepalive critical timeout: %d (minimum value is 5 seconds)", timeout)
 	}
 
+	logger.Debug("validating backend URLs is defined")
+	if len(a.config.BackendURLs) == 0 {
+		return errors.New("no backend URLs defined")
+	}
+
+	logger.Debug("validating backend URLs", a.config.BackendURLs)
+	for _, burl := range a.config.BackendURLs {
+		logger.Debug("validating backend URL", burl)
+		if u, err := url.Parse(burl); err != nil {
+			return fmt.Errorf("bad backend URL (%s): %s", burl, err)
+		} else {
+			if u.Scheme != "ws" && u.Scheme != "wss" {
+				return fmt.Errorf("backend URL (%s) must have ws:// or wss:// scheme", burl)
+			}
+		}
+	}
+
+	logger.Info("configuration successfully validated")
+
 	if !a.config.DisableAssets {
 		assetManager := asset.NewManager(a.config.CacheDir, a.getAgentEntity(), &a.wg)
 		var err error
-		a.assetGetter, err = assetManager.StartAssetManager(ctx)
+		limit := a.config.AssetsRateLimit
+		if limit == 0 {
+			limit = rate.Limit(asset.DefaultAssetsRateLimit)
+		}
+		a.assetGetter, err = assetManager.StartAssetManager(ctx, rate.NewLimiter(limit, a.config.AssetsBurstLimit))
 		if err != nil {
 			return err
 		}
@@ -223,7 +270,16 @@ func (a *Agent) Run(ctx context.Context) error {
 		a.StartStatsd(ctx)
 	}
 
-	go a.connectionManager(ctx)
+	if !a.config.DisableAPI {
+		a.StartAPI(ctx)
+	}
+
+	if !a.config.DisableSockets {
+		// Agent TCP/UDP sockets are deprecated in favor of the agent rest api
+		a.StartSocketListeners(ctx)
+	}
+
+	go a.connectionManager(ctx, cancel)
 	go a.refreshSystemInfoPeriodically(ctx)
 	go a.handleAPIQueue(ctx)
 
@@ -231,7 +287,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	return nil
 }
 
-func (a *Agent) connectionManager(ctx context.Context) {
+func (a *Agent) connectionManager(ctx context.Context, cancel context.CancelFunc) {
 	defer logger.Debug("shutting down connection manager")
 	for {
 		a.connectedMu.Lock()
@@ -243,7 +299,8 @@ func (a *Agent) connectionManager(ctx context.Context) {
 			if err == ctx.Err() {
 				return
 			}
-			log.Fatal(err)
+			logger.WithError(err).Error("couldn't connect to backend")
+			cancel()
 		}
 
 		ctx, cancel := context.WithCancel(ctx)
@@ -440,12 +497,12 @@ func (a *Agent) connectWithBackoff(ctx context.Context) (transport.Transport, er
 	}
 
 	err := backoff.Retry(func(retry int) (bool, error) {
-		url := a.backendSelector.Select()
+		backendURL := a.backendSelector.Select()
 
-		logger.Infof("connecting to backend URL %q", url)
+		logger.Infof("connecting to backend URL %q", backendURL)
 		a.header.Set("Accept", agentd.ProtobufSerializationHeader)
 		logger.WithField("header", fmt.Sprintf("Accept: %s", agentd.ProtobufSerializationHeader)).Debug("setting header")
-		c, respHeader, err := transport.Connect(url, a.config.TLS, a.header, a.config.BackendHandshakeTimeout)
+		c, respHeader, err := transport.Connect(backendURL, a.config.TLS, a.header, a.config.BackendHandshakeTimeout)
 		if err != nil {
 			logger.WithError(err).Error("reconnection attempt failed")
 			return false, nil

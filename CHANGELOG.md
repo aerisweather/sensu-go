@@ -5,7 +5,107 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic
 Versioning](http://semver.org/spec/v2.0.0.html).
 
+
 ## Unreleased
+
+## [5.20.1] - 2020-05-15
+*No changelog for this release.*
+
+## [5.20.0] - 2020-05-12
+
+### Added
+- Added ability to make the Resty HTTP Timeout configurable.
+- Added the `event.is_silenced` & `event.check.is_silenced` field selectors.
+- Added `processes` field to the system type to store agent local processes (commercial feature).
+- Users can now increment the logging level by sending SIGUSR1 to the
+sensu-backend or sensu-agent process.
+- Added a new `sensuctl describe-type` command to list all resource types.
+- Added `labels` and `annotations` as backend config options.
+- Added token substitution for assets.
+- Added `Edition` field to version information.
+- Added `GoVersion` field to version information.
+- Windows agent now has log rotation capabilities.
+- [Web] Added check hook output to event details page.
+
+### Changed
+- Warning messages from Resty library are now suppressed in sensuctl.
+- Notepad is now the default editor on Windows, instead of vi.
+- [Web] Any leading and trailing whitespace is now trimmed from the username
+when authenticating.
+- [Web] A toast is now displayed when a user attempts to delete an event but
+does not have appropriate authorization.
+- [Web] Only the first five groups a user belongs to are displayed in the
+preferences dialog. Showing too many made it difficult for users to locate the
+sign-out button.
+
+### Fixed
+- Windows agent now accepts and remembers arguments passed to 'service run' and
+'service install'.
+- Windows agent synchronizes writes to its log file, ensuring that file size
+will update with every log line written.
+- Windows agent now logs to both console and log file when 'service run' is used.
+- [Web] Fixed issue where the de-registration handler would always show up as
+undefined on the entity details page.
+
+## [5.19.3] - 2020-04-30
+
+### Added
+- Added a `timeout` flag to `sensu-backend init`.
+- [Web] Added the ability for labels and annotations with links to images to be
+displayed inline.
+- [Web] Added additional modes for those with colour blindness.
+- Added support for restarting the backend via SIGHUP. Config reloading is not
+supported yet.
+
+### Changed
+- Removed deprecated flags in `sensuctl silenced update` subcommand.
+### Fixed
+- `sensu-backend init` now logs any TLS failures encountered.
+- Fixes a bug in multi-line metric extraction that appeared in windows agents.
+- Fixed an authn bug where sensu-backend would restart when agents disconnect.
+- Fixed a bug where check state and last_ok were not computed until the second
+instance of the event.
+- Fix the validation for env_vars to allow the equal sign in values.
+- Log to the warning level when an asset is not installed because none of the
+filters matched.
+- Return underlying errors when fetching an asset.
+- Fixed a bug where the etcd event store would return prefixed matches rather than exact matches when getting events by entity.
+- `sensuctl logout` now resets the TLS configuration.
+- [Web] Fixes issue where labels with links could lead to a crash.
+- Added a global rate limit for fetching assets so that asset retries are not abusive (can be
+configured using `--assets-rate-limit` and `--assets-burst-limit` on the agent and backend).
+- [Web] Fixed an issue where trying to use an unregistered theme could lead to a
+crash.
+- Fixed a bug that would cause the backend to crash.
+- Fixed a bug that would cause messages like "unary invoker failed" to appear
+in the logs.
+- Fixed several goroutine leaks.
+- Fixed a bug that would cause the backend to crash when the etcd client got an
+error saying "etcdserver: too many requests".
+
+## [5.19.2] - 2020-04-27
+*No changelog for this release.*
+
+## [5.19.1] - 2020-04-13
+
+### Fixed
+- Require that pipe handlers have a command set.
+- The config file default path is now shown in the help for sensu-backend start
+and sensu-agent start.
+- Keepalives can now be published via the HTTP API.
+- Token substitution templates can now express escape-quoted strings.
+- [Web] Fixes issue where labels with links could lead to a crash.
+- Fixed a bug where keepalives would not always fire correctly when using
+the postgres event store.
+- The REST API now uses a timeout of 3 seconds by default when querying
+etcd health.
+- sensu-agent will not longer allow configuring keepalive timeouts less than
+the keepalive interval.
+- Eventd can no longer mistake keepalive events for checks with TTL.
+- Keepalives now generate a new event UUID for each keepalive failure event.
+- Agents now correctly reset keepalive switches on reconnect, fixing a bug
+where old keepalive timeout settings would persist too long.
+- The system's libc_type attribute is now populated on alpine containers.
 
 ## [5.19.0] - 2020-03-26
 
@@ -31,7 +131,6 @@ mistake.
 - Fixed a bug where the agent could connect to a backend using a namespace that
 doesn't exist.
 - Subscriptions can no longer be empty strings (#2932)
-### Fixed
 - The proper HTTP status codes are returned for unauthenticated & permission
 denied errors in the REST API.
 
