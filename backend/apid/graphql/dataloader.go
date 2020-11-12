@@ -24,6 +24,8 @@ const (
 	mutatorsLoaderKey
 	namespacesLoaderKey
 	silencedsLoaderKey
+
+	loaderPageSize = 1000
 )
 
 var (
@@ -124,12 +126,28 @@ func loadEntities(ctx context.Context, ns string) ([]*corev2.Entity, error) {
 
 // events
 
+func listAllEvents(ctx context.Context, c EventClient) ([]*corev2.Event, error) {
+	pred := &store.SelectionPredicate{Continue: "", Limit: int64(loaderPageSize)}
+	results := []*corev2.Event{}
+	for {
+		r, err := c.ListEvents(ctx, pred)
+		if err != nil {
+			return results, err
+		}
+		results = append(results, r...)
+		if pred.Continue == "" || len(r) < loaderPageSize {
+			break
+		}
+	}
+	return results, nil
+}
+
 func loadEventsBatchFn(c EventClient) dataloader.BatchFunc {
 	return func(ctx context.Context, keys dataloader.Keys) []*dataloader.Result {
 		results := make([]*dataloader.Result, 0, len(keys))
 		for _, key := range keys {
 			ctx := store.NamespaceContext(ctx, key.String())
-			records, err := c.ListEvents(ctx, &store.SelectionPredicate{})
+			records, err := listAllEvents(ctx, c)
 			result := &dataloader.Result{Data: records, Error: handleListErr(err)}
 			results = append(results, result)
 		}
@@ -248,7 +266,7 @@ func loadNamespacesBatchFn(c NamespaceClient) dataloader.BatchFunc {
 	return func(ctx context.Context, keys dataloader.Keys) []*dataloader.Result {
 		results := make([]*dataloader.Result, 0, len(keys))
 		for range keys {
-			records, err := c.ListNamespaces(ctx)
+			records, err := c.ListNamespaces(ctx, &store.SelectionPredicate{})
 			result := &dataloader.Result{Data: records, Error: handleListErr(err)}
 			results = append(results, result)
 		}

@@ -5,11 +5,80 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/)
 and this project adheres to [Semantic
 Versioning](http://semver.org/spec/v2.0.0.html).
 
-
 ## Unreleased
+
+### Fixed
+- Close the response body when done reading from it while downloading assets.
+- Fixed a bug where event filter or asset filter execution could cause a crash.
+
+## [5.21.2] - 2020-08-31
+
+### Fixed
+- Failed check events now get written to the event log file.
+
+## [5.21.1] - 2020-08-05
+
+### Changed
+- Improved agent websocket connection logging.
+
+### Fixed
+- Fixed potential Web UI crash when fetching events in namespace with > 1000 events.
+- Errors produced in the agent by assets, check validation, token substitution,
+and event unmarshaling are logged once again.
+
+## [5.21.0] - 2020-06-10
+
+### Added
+- Added `SENSU_LICENSE_FILE` environment variable to handler executions.
+- Added the `sensuctl user hash-password` command to generate password hashes
+- Added the ability to reset passwords via the backend API & `sensuctl user
+reset-password`
+- The user resource now has a `password_hash` field to specify the password
+hash, in place of the cleartext password
+- Added the beginnings of the core/v3 API.
+- Added automatically generated tests for the core/v2 API.
+
+### Changed
+- `sensu-agent`'s default log level is now `info` instead of `warn`.
+- `sensuctl command exec` now spawns the plugin directly instead of going
+  through a sub-shell.
+
+### Fixed
+- The password verification logic when running `sensuctl user change-password`
+has been moved from sensuctl to the backend API.
+- Errors while publishing proxy check requests do not block scheduling for other
+entities.
+- Listing namespaces in sensuctl with `--chunk-size` now works properly.
+- Prevent the agent from immediately exiting in certain scenarios where
+components are disabled.
+- Fixed an issue where a GraphQL query could fail when querying a namespace
+containing event data in excess of 2GBs.
+- Deregistration events now contain a timestamp.
+- Checks configured with missing hooks no longer cause the agent to crash.
+
+## [5.20.2] - 2020-05-26
+
+### Added
+- Added the username as a field to the API request logger.
+
+### Changed
+- The Process struct only contains the name of the process.
+
+### Fixed
+- The proper libc implementation is now displayed for Ubuntu entities.
+- Add validation for subjects in RBAC RoleBinding and ClusterRoleBinding.
+- Fixed a bug where single-letter subscriptions were not allowed, even though
+they were intended to be.
+- Fix retrieving command assets from bonsai.
 
 ## [5.20.1] - 2020-05-15
 *No changelog for this release.*
+
+### Added
+- Added the ability to omit types from sensuctl dump when using the "all" flag.
+
+### Fixed
+- Fixed a bug in sensuctl dump where duplicate resource names could be specified.
 
 ## [5.20.0] - 2020-05-12
 
@@ -24,6 +93,8 @@ sensu-backend or sensu-agent process.
 - Added token substitution for assets.
 - Added `Edition` field to version information.
 - Added `GoVersion` field to version information.
+- Assets paths are now accessible to consumers via an environment variable.
+- Added a helper function to token substitution to retrieve an asset path.
 - Windows agent now has log rotation capabilities.
 - [Web] Added check hook output to event details page.
 
