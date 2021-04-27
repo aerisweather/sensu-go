@@ -1,0 +1,31 @@
+#!/bin/bash
+
+# Make sure the Debian version matches what we run in EC2.
+# That will ensure that glibc is compatible.
+GOLANG_CONTAINER_VERSION='1.16-buster'
+
+script_dir=$(dirname "$0")
+cd "$script_dir"
+
+if [[ "$IN_GOLANG_DOCKER" != '1' ]]; then
+    docker run \
+        -u "$(id -u)" \
+        -v "$PWD:/build" \
+        -e IN_GOLANG_DOCKER=1 \
+        -e GOCACHE='/build/.gocache' \
+        --rm -it \
+        --entrypoint /build/aeris-build \
+        "golang:$GOLANG_CONTAINER_VERSION"
+else
+    build_version=$(git describe --always --abbrev=7 --dirty)
+    read -r -d '' ldflags <<EOF
+        -X "github.com/sensu/sensu-go/version.BuildDate=$(date --iso-8601=minute)"
+        -X "github.com/sensu/sensu-go/version.BuildSHA=$(git rev-parse HEAD)"
+        -X "github.com/sensu/sensu-go/version.Version=$build_version"
+EOF
+    build_extra_args=(-ldflags "$ldflags")
+    binaries=(sensu-agent sensu-backend sensuctl)
+    for b in "${binaries[@]}"; do
+        go build "${build_extra_args[@]}" -o "bin/$b" "./cmd/$b"
+    done
+fi

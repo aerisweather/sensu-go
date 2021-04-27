@@ -47,3 +47,6 @@ version-bin
 
 # editors
 .idea
+
+# go cache
+.gocache
